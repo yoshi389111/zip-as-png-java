@@ -7,6 +7,7 @@
 package net.the_blue_pla.net.zipaspng;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
@@ -87,7 +88,7 @@ public final class ZipAsPng {
 
 		try (FileChannel inZip = FileChannel.open(targetZip, StandardOpenOption.READ);
 				FileChannel inPng = FileChannel.open(basePng, StandardOpenOption.READ);
-				FileChannel out = FileChannel.open(outZipAsPng, StandardOpenOption.WRITE,
+				OutputStream out = Files.newOutputStream(outZipAsPng, StandardOpenOption.WRITE,
 						StandardOpenOption.CREATE_NEW)) {
 
 			ByteBuffer zipContent = inZip.map(MapMode.READ_ONLY, 0, zipSize)
@@ -95,120 +96,142 @@ public final class ZipAsPng {
 			ByteBuffer pngContent = inPng.map(MapMode.READ_ONLY, 0, pngSize)
 					.order(ByteOrder.BIG_ENDIAN);
 
-			// PNGファイルのヘッダ+IHDR前半チェック
-			ByteBuffer pngHeader = subBuffer(pngContent, HEAD_PNG.length);
-			ByteBuffer pngMagicNumber = ByteBuffer.wrap(HEAD_PNG);
-			if (pngMagicNumber.compareTo(pngHeader) != 0) {
-				throw new IllegalArgumentException(
-						"PNGヘッダがおかしい. path=" + basePng.toString());
-			}
-			if (lastIndexOfSigneture(pngContent) != NOT_FOUND) {
-				throw new IllegalArgumentException(
-						"PNGにEOCDシグネチャが含まれている. path=" + basePng.toString());
-			}
-
-			// ZIPファイルのEOCDの位置を取得
-			int positionOfEOCD = lastIndexOfSigneture(zipContent);
-			if (positionOfEOCD == NOT_FOUND) {
-				// EOCDのシグネチャ が見つからない
-				throw new IllegalArgumentException("ZIPファイルでEOCDが見つからない. path=" + targetZip);
-			}
-
-			// ZIPファイルのCENの位置を取得
-			int positionOfCEN = zipContent.getInt(positionOfEOCD + ZipFile.ENDOFF);
-			if (positionOfEOCD <= positionOfCEN) {
-				throw new IllegalArgumentException("CENとEOCDの順番が不正. "
-						+ "path=" + targetZip
-						+ ", cen=0x" + Integer.toHexString(positionOfCEN)
-						+ ", eocd=0x" + Integer.toHexString(positionOfEOCD));
-			}
-			if (SIG_CEN != zipContent.getInt(positionOfCEN)) {
-				// 指定された位置にCENがない
-				throw new IllegalArgumentException("ZIPファイルでCENが見つからない. path=" + targetZip);
-			}
-
-			// CENの合計サイズを取得
-			int sizeOfCen = zipContent.getInt(positionOfEOCD + ZipFile.ENDSIZ);
-
-			pngContent.clear();
-			zipContent.clear();
-			CRC32 crc = new CRC32();
-
-			// PNGのヘッダを出力（コピー）
-			write(out, subBuffer(pngContent, SIZE_PNG_HEAD));
-			// IHDRチャンクを出力（コピー）
-			write(out, subBuffer(pngContent, SIZE_PNG_IHDR));
-
-			// ZIPコンテナチャンクの「長さ」を出力
-			writeBigEndian(out, (int) zipSize);
-
-			// ZIPコンテナチャンクの「チャンクタイプ」を出力
-			ByteBuffer type = ByteBuffer.wrap("ziPc".getBytes(StandardCharsets.US_ASCII));
-			crc.update(type.duplicate());
-			write(out, type);
-
-			// ZIPファイルのCENの手前までをコピー
-			ByteBuffer sub = subBuffer(zipContent, positionOfCEN);
-			crc.update(sub.duplicate());
-			write(out, sub);
-
-			// CENを繰り返し処理する
-			for (int size = 0; size < sizeOfCen;) {
-
-				// CENを読み込み、LOCのoffsetを補正して出力
-				ByteBuffer cen = copyOf(subBuffer(zipContent, SIZE_ZIP_CEN));
-				int offsetOfLocalHeader = cen.getInt(ZipFile.CENOFF);
-				cen.putInt(ZipFile.CENOFF, offsetOfLocalHeader + OFFSET_ZIP);
-				crc.update(cen.duplicate());
-				write(out, cen);
-				size += SIZE_ZIP_CEN;
-
-				// CENの後ろのデータ(ファイル名、追加情報、コメント)を出力
-				int extraContentsLength = cen.getInt(ZipFile.CENNAM)
-						+ cen.getInt(ZipFile.CENEXT)
-						+ cen.getInt(ZipFile.CENCOM);
-				ByteBuffer extraContents = subBuffer(zipContent, extraContentsLength);
-				crc.update(extraContents.duplicate());
-				write(out, extraContents);
-				size += extraContentsLength;
-			}
-			if (zipContent.position() != positionOfCEN + sizeOfCen) {
-				// CENの合計サイズがおかしい
-				throw new IllegalArgumentException("CENのサイズがあっていない");
-			}
-
-			if (positionOfCEN + sizeOfCen < positionOfEOCD) {
-				// CENの終わりとEOCDの間に何かあればそれを出力
-				ByteBuffer gap = subBuffer(zipContent, positionOfEOCD - (positionOfCEN + sizeOfCen));
-				crc.update(gap.duplicate());
-				write(out, gap);
-			}
-
-			// EOCDを読み込み、CENのoffsetを補正して出力
-			ByteBuffer eocd = copyOf(subBuffer(zipContent, SIZE_ZIP_EOCD));
-			eocd.putInt(ZipFile.ENDOFF, positionOfCEN + OFFSET_ZIP);
-			crc.update(eocd.duplicate());
-			write(out, eocd);
-
-			// EOCDの後ろに何かあればそれを出力
-			crc.update(zipContent.duplicate());
-			write(out, zipContent);
-
-			// ZIPコンテナチャンクの「CRC」を出力
-			int valueOfCrc32 = (int) crc.getValue();
-			if (valueOfCrc32 == Integer.reverseBytes(SIG_EOCD)) {
-				// 不幸にもCRC32の結果が EOCDのシグネチャになった場合
-				throw new IllegalArgumentException(
-						"ZIPコンテナチャンクのCRC32が偶然、EOCDのシグネチャと同じ値になってしまった");
-				// TODO 何か対策を考える？
-				// 案1：チャンクタイプを２種類用意して、切り替える
-				// 案2:チャンクデータに余計なデータを出力して、CRC32の値を調整する
-			}
-			writeBigEndian(out, valueOfCrc32);
-
-			// PNGの残り(IHDRの後ろ)のデータをコピー
-			write(out, pngContent);
+			disguise(zipContent, pngContent, out);
 		}
+	}
+
+	/**
+	 * ZIPをPNGに偽装する.
+	 *
+	 * @param zipContent
+	 *            偽装対象のZIPファイルの内容
+	 * @param pngContent
+	 *            元となるPNGファイルの内容
+	 * @param out
+	 *            出力先
+	 * @throws IOException
+	 *             入出力エラー時
+	 * @throws IllegalArgumentException
+	 *             ZIP/PNGファイルがおかしい場合
+	 * @throws NullPointerException
+	 *             引数がnullの場合
+	 */
+	public static void disguise(ByteBuffer zipContent,
+			ByteBuffer pngContent, OutputStream out) throws IOException {
+
+		long zipSize = zipContent.remaining();
+
+		// PNGファイルのヘッダ+IHDR前半チェック
+		ByteBuffer pngHeader = subBuffer(pngContent, HEAD_PNG.length);
+		ByteBuffer pngMagicNumber = ByteBuffer.wrap(HEAD_PNG);
+		if (pngMagicNumber.compareTo(pngHeader) != 0) {
+			throw new IllegalArgumentException("PNGヘッダがおかしい.");
+		}
+		if (lastIndexOfSigneture(pngContent) != NOT_FOUND) {
+			throw new IllegalArgumentException("PNGにEOCDシグネチャが含まれている.");
+		}
+
+		// ZIPファイルのEOCDの位置を取得
+		int positionOfEOCD = lastIndexOfSigneture(zipContent);
+		if (positionOfEOCD == NOT_FOUND) {
+			// EOCDのシグネチャ が見つからない
+			throw new IllegalArgumentException("ZIPファイルでEOCDが見つからない.");
+		}
+
+		// ZIPファイルのCENの位置を取得
+		int positionOfCEN = zipContent.getInt(positionOfEOCD + ZipFile.ENDOFF);
+		if (positionOfEOCD <= positionOfCEN) {
+			throw new IllegalArgumentException("CENとEOCDの順番が不正. "
+					+ "cen=0x" + Integer.toHexString(positionOfCEN)
+					+ ", eocd=0x" + Integer.toHexString(positionOfEOCD));
+		}
+		if (SIG_CEN != zipContent.getInt(positionOfCEN)) {
+			// 指定された位置にCENがない
+			throw new IllegalArgumentException("ZIPファイルでCENが見つからない.");
+		}
+
+		// CENの合計サイズを取得
+		int sizeOfCen = zipContent.getInt(positionOfEOCD + ZipFile.ENDSIZ);
+
+		pngContent.clear();
+		zipContent.clear();
+		CRC32 crc = new CRC32();
+
+		// PNGのヘッダを出力（コピー）
+		write(out, subBuffer(pngContent, SIZE_PNG_HEAD));
+		// IHDRチャンクを出力（コピー）
+		write(out, subBuffer(pngContent, SIZE_PNG_IHDR));
+
+		// ZIPコンテナチャンクの「長さ」を出力
+		writeBigEndian(out, (int) zipSize);
+
+		// ZIPコンテナチャンクの「チャンクタイプ」を出力
+		ByteBuffer type = ByteBuffer.wrap("ziPc".getBytes(StandardCharsets.US_ASCII));
+		crc.update(type.duplicate());
+		write(out, type);
+
+		// ZIPファイルのCENの手前までをコピー
+		ByteBuffer sub = subBuffer(zipContent, positionOfCEN);
+		crc.update(sub.duplicate());
+		write(out, sub);
+
+		// CENを繰り返し処理する
+		for (int size = 0; size < sizeOfCen;) {
+
+			// CENを読み込み、LOCのoffsetを補正して出力
+			ByteBuffer cen = copyOf(subBuffer(zipContent, SIZE_ZIP_CEN));
+			int offsetOfLocalHeader = cen.getInt(ZipFile.CENOFF);
+			cen.putInt(ZipFile.CENOFF, offsetOfLocalHeader + OFFSET_ZIP);
+			crc.update(cen.duplicate());
+			write(out, cen);
+			size += SIZE_ZIP_CEN;
+
+			// CENの後ろのデータ(ファイル名、追加情報、コメント)を出力
+			int extraContentsLength = cen.getInt(ZipFile.CENNAM)
+					+ cen.getInt(ZipFile.CENEXT)
+					+ cen.getInt(ZipFile.CENCOM);
+			ByteBuffer extraContents = subBuffer(zipContent, extraContentsLength);
+			crc.update(extraContents.duplicate());
+			write(out, extraContents);
+			size += extraContentsLength;
+		}
+		if (zipContent.position() != positionOfCEN + sizeOfCen) {
+			// CENの合計サイズがおかしい
+			throw new IllegalArgumentException("CENのサイズがあっていない");
+		}
+
+		if (positionOfCEN + sizeOfCen < positionOfEOCD) {
+			// CENの終わりとEOCDの間に何かあればそれを出力
+			ByteBuffer gap = subBuffer(zipContent, positionOfEOCD - (positionOfCEN + sizeOfCen));
+			crc.update(gap.duplicate());
+			write(out, gap);
+		}
+
+		// EOCDを読み込み、CENのoffsetを補正して出力
+		ByteBuffer eocd = copyOf(subBuffer(zipContent, SIZE_ZIP_EOCD));
+		eocd.putInt(ZipFile.ENDOFF, positionOfCEN + OFFSET_ZIP);
+		crc.update(eocd.duplicate());
+		write(out, eocd);
+
+		// EOCDの後ろに何かあればそれを出力
+		crc.update(zipContent.duplicate());
+		write(out, zipContent);
+
+		// ZIPコンテナチャンクの「CRC」を出力
+		int valueOfCrc32 = (int) crc.getValue();
+		if (valueOfCrc32 == Integer.reverseBytes(SIG_EOCD)) {
+			// 不幸にもCRC32の結果が EOCDのシグネチャになった場合
+			throw new IllegalArgumentException(
+					"ZIPコンテナチャンクのCRC32が偶然、EOCDのシグネチャと同じ値になってしまった");
+			// TODO 何か対策を考える？
+			// 案1：チャンクタイプを２種類用意して、切り替える
+			// 案2:チャンクデータに余計なデータを出力して、CRC32の値を調整する
+		}
+		writeBigEndian(out, valueOfCrc32);
+
+		// PNGの残り(IHDRの後ろ)のデータをコピー
+		write(out, pngContent);
+
 	}
 
 	/**
@@ -255,18 +278,16 @@ public final class ZipAsPng {
 	}
 
 	/** 出力チャネルにバッファを出力 */
-	private static void write(FileChannel out, ByteBuffer buff)
+	private static void write(OutputStream out, ByteBuffer buff)
 			throws IOException {
 		while (buff.hasRemaining()) {
-			int length = out.write(buff);
-			if (length == 0) {
-				throw new IOException("チャネルに書き込めない");
-			}
+			byte b = buff.get();
+			out.write(b);
 		}
 	}
 
 	/** 出力チャネルに4byte整数をBIG_ENDIANで出力 */
-	private static void writeBigEndian(FileChannel out, int value)
+	private static void writeBigEndian(OutputStream out, int value)
 			throws IOException {
 		ByteBuffer buff = ByteBuffer.allocate(Integer.BYTES)
 				.order(ByteOrder.BIG_ENDIAN).putInt(value);
