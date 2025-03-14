@@ -1,4 +1,4 @@
-# ZipAsPng.java [![Build Status](https://travis-ci.org/yoshi389111/zip-as-png-java.svg?branch=master)](https://travis-ci.org/yoshi389111/zip-as-png-java)
+# ZipAsPng.java
 
 ZIPファイルをPNGファイルに偽装するJava実装サンプル
 
